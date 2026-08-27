@@ -184,19 +184,43 @@ jobs:
           # so this gate VERIFIES the pinned commit already has green required checks rather
           # than triggering CI. CI runs on every push to development, so in the normal case the
           # checks exist. If they do not, that is a real halt: nothing has tested these bytes.
+          CI_TIMEOUT=$(jq -r '.ci_timeout_minutes // 20' config/repos.json)
+
           jq -c '.[] | select(.delta > 0)' /tmp/checked.json | while read -r r; do
             NAME=$(echo "$r" | jq -r .name)
             SHA=$(echo "$r" | jq -r .pinned)
-            RUNS=$(gh api "repos/$ORG/$NAME/commits/$SHA/check-runs" --jq '[.check_runs[] | {name, conclusion}]')
+            REQ=$(echo "$r" | jq -c '.required_checks')
 
-            echo "$r" | jq -r '.required_checks[]' | while read -r CHECK; do
-              CONC=$(echo "$RUNS" | jq -r --arg c "$CHECK" '.[] | select(.name==$c) | .conclusion' | head -1)
-              case "$CONC" in
-                success) echo "  $NAME/$CHECK: green" ;;
-                "")      echo "::error::$NAME: required check '$CHECK' has never run on $SHA. These exact bytes are untested - refusing to ship."; echo HALT > /tmp/halt3 ;;
-                *)       echo "::error::$NAME: required check '$CHECK' is '$CONC' on $SHA."; echo HALT > /tmp/halt3 ;;
-              esac
+            # Pressing seconds after a merge is normal, and CI may not have registered yet.
+            # "Not started" and "finished red" are different situations: wait for the first,
+            # halt on the second. Treating both as untested made a legitimate press fail and
+            # forced a re-press - the friction this design exists to avoid.
+            #
+            # All check matching goes through jq, never shell word-splitting: real check names
+            # contain spaces (dash-admin's "Frontend Build" / "Backend Build").
+            for _ in $(seq 1 $(( CI_TIMEOUT * 4 ))); do
+              RUNS=$(gh api "repos/$ORG/$NAME/commits/$SHA/check-runs" \
+                --jq '[.check_runs[] | {name, status, conclusion}]' 2>/dev/null || echo '[]')
+              PENDING=$(jq -n --argjson runs "$RUNS" --argjson req "$REQ" \
+                '[ $req[] | . as $c | ($runs | map(select(.name==$c)) | last | .status // "absent") ]
+                 | map(select(. != "completed")) | length')
+              if [ "$PENDING" = "0" ]; then break; fi
+              echo "  $NAME: waiting on $PENDING required check(s) at ${SHA:0:8}"
+              sleep 15
             done
+
+            BAD=$(jq -n --argjson runs "$RUNS" --argjson req "$REQ" \
+              '[ $req[] | . as $c
+                 | {check:$c, conclusion: ($runs | map(select(.name==$c)) | last | .conclusion // "never ran")} ]
+               | map(select(.conclusion != "success"))')
+
+            if [ "$(echo "$BAD" | jq 'length')" = "0" ]; then
+              echo "  $NAME: all required checks green on ${SHA:0:8}"
+            else
+              echo "$BAD" | jq -r --arg n "$NAME" --arg s "$SHA" '.[] |
+                "::error::\($n): required check \(.check|tojson) is \(.conclusion|tojson) on \($s). Refusing to ship bytes that are not green."'
+              echo HALT > /tmp/halt3
+            fi
           done
           [ -f /tmp/halt3 ] && exit 1 || true
 
