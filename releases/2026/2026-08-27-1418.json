@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-08-27-1418",
+  "actor": "ArtemDokuchaev",
+  "run_url": "https://github.com/Testing-Organization-33/pilot-infra/actions/runs/33081505551",
+  "forced": false,
+  "reason": "FE+BE only - rehearsal of the \"partial\" path; nothing else queued",
+  "maintenance_ack": "none",
+  "partial": true,
+  "repos": [
+    {
+      "name": "pilot-api",
+      "from": "46d6daab8ccf9fce35c690c0c660f45d1ed15734",
+      "to": "46d6daab8ccf9fce35c690c0c660f45d1ed15734",
+      "delta": 0,
+      "migrations": [],
+      "result": "no-delta",
+      "deploy_run": null
+    },
+    {
+      "name": "pilot-web",
+      "from": "c45ca1210b49dd851d3ac2abe07520c709dde7ad",
+      "to": "c45ca1210b49dd851d3ac2abe07520c709dde7ad",
+      "delta": 0,
+      "migrations": [],
+      "result": "no-delta",
+      "deploy_run": null
+    }
+  ]
+}
