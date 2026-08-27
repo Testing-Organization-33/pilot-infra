@@ -1,0 +1,5 @@
+{
+  "_comment": "Expiring promotion pause. paused_until is an ISO-8601 UTC timestamp or null. Promote proceeds whenever it is in the past. Cap extensions at 48h - a boolean pause becomes a freeze, which is what June 2026 proved.",
+  "paused_until": null,
+  "reason": ""
+}

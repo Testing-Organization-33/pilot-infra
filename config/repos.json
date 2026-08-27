@@ -1,0 +1,23 @@
+{
+  "_comment": "Ship order is the array order. Consolidating into dash-infra is a swap of this file, not a code change: replace with dash-backend-global, dash-admin, dash-frontend-local, dash-webhook-proxy.",
+  "org": "Testing-Organization-33",
+  "breaker_delta": 40,
+  "deploy_timeout_minutes": 15,
+  "tag_prune_days": 90,
+  "ship_order": [
+    {
+      "name": "pilot-api",
+      "ci_workflow": "ci.yml",
+      "deploy_workflow": "deploy.yml",
+      "required_checks": ["unit-tests", "build"],
+      "migrations_path": "migrations/"
+    },
+    {
+      "name": "pilot-web",
+      "ci_workflow": "ci.yml",
+      "deploy_workflow": "deploy.yml",
+      "required_checks": ["build"],
+      "migrations_path": ""
+    }
+  ]
+}

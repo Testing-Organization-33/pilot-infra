@@ -1,0 +1,91 @@
+name: Queue digest
+on:
+  schedule:
+    - cron: "0 7 * * 1-5"
+  workflow_dispatch:
+
+# Read-only. Three jobs in one message:
+#   1. cadence nag  - queue depth per repo, days since the last promotion
+#   2. heartbeat    - a growing number in a daily message means silence is visible
+#   3. bypass alarm - main moved without a manifest explaining it
+#
+# Replaces the 36h heartbeat: at a few presses per week a 36h alarm fires every quiet
+# Monday and trains alert-blindness. A number that climbs carries the same signal.
+
+permissions:
+  contents: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build digest
+        id: digest
+        run: |
+          set -uo pipefail
+          ORG=$(jq -r .org config/repos.json)
+
+          LAST=$(find releases -name '*.json' -type f 2>/dev/null | sort | tail -1)
+          if [ -n "$LAST" ]; then
+            LAST_TS=$(jq -r .timestamp "$LAST")
+            LAST_DATE=$(echo "$LAST_TS" | cut -c1-10)
+            DAYS=$(( ( $(date -u +%s) - $(date -u -d "$LAST_DATE" +%s) ) / 86400 ))
+          else
+            LAST_TS="never"; DAYS="-"
+          fi
+
+          {
+            echo "## Queue digest $(date -u +%F)"
+            echo ""
+            echo "Last promotion: **$LAST_TS** (${DAYS} days ago)"
+            echo ""
+            echo "| repo | queued on development | oldest queued | prod state |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ALARM=""
+          jq -r '.ship_order[].name' config/repos.json | while read -r NAME; do
+            CMP=$(gh api "repos/$ORG/$NAME/compare/main...development" 2>/dev/null)
+            AHEAD=$(echo "$CMP" | jq -r '.ahead_by // "?"')
+            BEHIND=$(echo "$CMP" | jq -r '.behind_by // "?"')
+            OLDEST=$(echo "$CMP" | jq -r '.commits[0].commit.author.date // "-"' | cut -c1-10)
+
+            DSTATE=$(gh api "repos/$ORG/$NAME/contents/state.json?ref=deploy-state" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
+            DEPLOYED=$(echo "$DSTATE" | jq -r '.deployed_sha // "unknown"')
+
+            echo "| $NAME | $AHEAD | $OLDEST | \`${DEPLOYED:0:8}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+            # Bypass detector: main should only ever be at a SHA some manifest recorded.
+            MAIN=$(gh api "repos/$ORG/$NAME/git/ref/heads/main" --jq .object.sha 2>/dev/null)
+            if [ -n "$MAIN" ] && ! grep -rqs "$MAIN" releases/; then
+              echo "::warning::$NAME: main is at ${MAIN:0:8}, which no manifest records. Either someone pushed outside the pipeline, or a hotfix landed - check for an open back-merge sync PR."
+              echo "OOB $NAME ${MAIN:0:8}" >> /tmp/alarm
+            fi
+            if [ "$BEHIND" != "0" ] && [ "$BEHIND" != "?" ]; then
+              echo "::warning::$NAME: main is $BEHIND ahead of development - ancestry broken, the next promotion will halt until the sync PR merges."
+              echo "ANCESTRY $NAME" >> /tmp/alarm
+            fi
+          done
+
+          if [ -f /tmp/alarm ]; then
+            { echo ""; echo "### Alarms"; echo ""; sed 's/^/- /' /tmp/alarm; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Post digest
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "::notice::SLACK_WEBHOOK_URL not set - digest is in the job summary only."
+            exit 0
+          fi
+          BODY="Queue digest $(date -u +%F) - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -f /tmp/alarm ]; then BODY="$BODY"$'\n'"ALARMS:"$'\n'"$(cat /tmp/alarm)"; fi
+          jq -n --arg t "$BODY" '{text:$t}' \
+            | curl -sS -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL"

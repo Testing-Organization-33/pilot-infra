@@ -1,0 +1,381 @@
+name: Promote
+run-name: "Promote ${{ inputs.repos }}${{ inputs.force == true && ' [FORCED]' || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Which repos to promote. 'all' = full ship order. A subset marks the run PARTIAL."
+        required: true
+        default: "all"
+        type: string
+      force:
+        description: "Override the batch circuit breaker and the weekend-eve warning. Requires a reason."
+        required: false
+        default: false
+        type: boolean
+      reason:
+        description: "Why this run is irregular. Posted verbatim and stored in the manifest."
+        required: false
+        default: ""
+        type: string
+      maintenance_ack:
+        description: "Required when the batch contains migrations."
+        required: false
+        default: "none"
+        type: choice
+        options: [none, maintenance-on, no-maintenance]
+
+# ONE press. SHAs are pinned in phase 1 and everything downstream uses them, never a branch
+# name - so the run ships exactly what it checked. There is no ref input and no candidate
+# state: candidate lifetime is the length of this run.
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
+  TS: ""
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard - force requires a reason
+        if: inputs.force == true && inputs.reason == ''
+        run: |
+          echo "::error::force:true requires a reason. It is recorded in the manifest and posted verbatim."
+          exit 1
+
+      # ---------------------------------------------------------------- phase 1: pin
+      - name: Phase 1 - pin development tips
+        id: pin
+        run: |
+          set -euo pipefail
+          ORG=$(jq -r .org config/repos.json)
+          TS=$(date -u +%Y-%m-%d-%H%M)
+          echo "TS=$TS" >> "$GITHUB_ENV"
+          echo "ORG=$ORG" >> "$GITHUB_ENV"
+
+          if [ "${{ inputs.repos }}" = "all" ]; then
+            SELECTED=$(jq -c '[.ship_order[].name]' config/repos.json)
+          else
+            SELECTED=$(echo "${{ inputs.repos }}" | tr ',' '\n' | jq -R . | jq -sc .)
+          fi
+          echo "selected: $SELECTED"
+
+          # Preserve ship order regardless of how the input was typed.
+          jq -c --argjson sel "$SELECTED" \
+            '[.ship_order[] | select(.name as $n | $sel | index($n))]' \
+            config/repos.json > /tmp/plan.json
+
+          COUNT=$(jq 'length' /tmp/plan.json)
+          if [ "$COUNT" = "0" ]; then
+            echo "::error::no repos matched '${{ inputs.repos }}'"
+            exit 1
+          fi
+
+          # Pin every selected repo's development tip. Nothing downstream reads a branch name.
+          jq -c '.[]' /tmp/plan.json | while read -r r; do
+            NAME=$(echo "$r" | jq -r .name)
+            SHA=$(gh api "repos/$ORG/$NAME/git/ref/heads/development" --jq .object.sha)
+            MAIN=$(gh api "repos/$ORG/$NAME/git/ref/heads/main" --jq .object.sha)
+            echo "$r" | jq -c --arg s "$SHA" --arg m "$MAIN" '. + {pinned:$s, main_before:$m}'
+          done > /tmp/pinned.jsonl
+
+          jq -s -c . /tmp/pinned.jsonl > /tmp/pinned.json
+          jq -r '.[] | "  \(.name): main \(.main_before[0:8]) -> pinned \(.pinned[0:8])"' /tmp/pinned.json
+
+          {
+            echo "## Promote $TS"
+            echo ""
+            echo "| repo | main before | pinned development tip |"
+            echo "|---|---|---|"
+            jq -r '.[] | "| \(.name) | `\(.main_before[0:8])` | `\(.pinned[0:8])` |"' /tmp/pinned.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------ phase 2: preflight
+      - name: Phase 2 - preflight
+        id: preflight
+        run: |
+          set -euo pipefail
+          BREAKER=$(jq -r .breaker_delta config/repos.json)
+
+          PAUSED=$(jq -r '.paused_until // "null"' state/pause.json)
+          if [ "$PAUSED" != "null" ] && [ "$PAUSED" != "" ]; then
+            NOW=$(date -u +%s); UNTIL=$(date -u -d "$PAUSED" +%s 2>/dev/null || echo 0)
+            if [ "$UNTIL" -gt "$NOW" ]; then
+              echo "::error::promotion paused until $PAUSED - $(jq -r .reason state/pause.json)"
+              exit 1
+            fi
+            echo "pause expired at $PAUSED, proceeding"
+          fi
+
+          HALT=0
+          MIGRATIONS_FOUND=0
+          : > /tmp/checked.jsonl
+
+          jq -c '.[]' /tmp/pinned.json | while read -r r; do
+            NAME=$(echo "$r" | jq -r .name)
+            SHA=$(echo "$r" | jq -r .pinned)
+            MPATH=$(echo "$r" | jq -r .migrations_path)
+
+            CMP=$(gh api "repos/$ORG/$NAME/compare/main...$SHA")
+            STATUS=$(echo "$CMP" | jq -r .status)
+            AHEAD=$(echo "$CMP" | jq -r .ahead_by)
+            BEHIND=$(echo "$CMP" | jq -r .behind_by)
+
+            # stdout in this loop is the JSONL stream - all diagnostics must go to stderr.
+            # Ancestry: main must be an ancestor of the pinned SHA, or ff is impossible.
+            if [ "$BEHIND" != "0" ]; then
+              echo "::error::$NAME: main is $BEHIND commits ahead of the pinned SHA - ancestry broken, fast-forward impossible. A hotfix landed on main; merge the back-merge sync PR first: https://github.com/$ORG/$NAME/pulls" >&2
+              echo "HALT" > /tmp/halt
+            fi
+
+            MIGS="[]"
+            if [ -n "$MPATH" ] && [ "$MPATH" != "null" ]; then
+              MIGS=$(echo "$CMP" | jq -c --arg p "$MPATH" '[.files[]?.filename | select(startswith($p))]')
+              if [ "$(echo "$MIGS" | jq 'length')" != "0" ]; then echo "MIGS" > /tmp/migs; fi
+            fi
+
+            if [ "$AHEAD" -gt "$BREAKER" ] && [ "${{ inputs.force }}" != "true" ]; then
+              echo "::error::$NAME: delta $AHEAD exceeds breaker $BREAKER. Re-run with force:true and a reason if this batch is intended." >&2
+              echo "HALT" > /tmp/halt
+            fi
+
+            echo "$r" | jq -c --arg st "$STATUS" --argjson a "$AHEAD" --argjson m "$MIGS" \
+              '. + {status:$st, delta:$a, migrations:$m}'
+          done > /tmp/checked.jsonl
+
+          jq -s -c . /tmp/checked.jsonl > /tmp/checked.json
+          if [ -f /tmp/halt ]; then exit 1; fi
+
+          if [ -f /tmp/migs ] && [ "${{ inputs.maintenance_ack }}" = "none" ]; then
+            echo "::error::this batch contains migrations. Re-run with maintenance_ack = maintenance-on (turn maintenance on first) or no-maintenance (asserting the migration is expand-only and safe to ship live). Silence is not an option."
+            jq -r '.[] | select((.migrations|length) > 0) | "  " + .name + ": " + (.migrations|tostring)' /tmp/checked.json
+            exit 1
+          fi
+
+          {
+            echo ""
+            echo "### Preflight"
+            echo ""
+            echo "| repo | delta | migrations |"
+            echo "|---|---|---|"
+            jq -r '.[] | "| \(.name) | \(.delta) | \(if (.migrations|length)>0 then (.migrations|join("<br>")) else "-" end) |"' /tmp/checked.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Weekend-eve notice
+        run: |
+          DOW=$(date -u +%u)
+          if [ "$DOW" -ge 5 ]; then
+            echo "::warning::Pressed on a Friday or weekend. Warned, not blocked. Check: is anyone available to fix forward if this breaks? Recovery ladder is in the release-rollback skill."
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "> **Weekend-eve press.** Fix-forward is the recovery path and it needs a human." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # -------------------------------------------------------------- phase 3: CI gate
+      - name: Phase 3 - CI gate on the pinned SHAs
+        run: |
+          set -euo pipefail
+          # NOTE: workflow_dispatch cannot target a bare SHA (GitHub requires a branch or tag),
+          # so this gate VERIFIES the pinned commit already has green required checks rather
+          # than triggering CI. CI runs on every push to development, so in the normal case the
+          # checks exist. If they do not, that is a real halt: nothing has tested these bytes.
+          jq -c '.[] | select(.delta > 0)' /tmp/checked.json | while read -r r; do
+            NAME=$(echo "$r" | jq -r .name)
+            SHA=$(echo "$r" | jq -r .pinned)
+            RUNS=$(gh api "repos/$ORG/$NAME/commits/$SHA/check-runs" --jq '[.check_runs[] | {name, conclusion}]')
+
+            echo "$r" | jq -r '.required_checks[]' | while read -r CHECK; do
+              CONC=$(echo "$RUNS" | jq -r --arg c "$CHECK" '.[] | select(.name==$c) | .conclusion' | head -1)
+              case "$CONC" in
+                success) echo "  $NAME/$CHECK: green" ;;
+                "")      echo "::error::$NAME: required check '$CHECK' has never run on $SHA. These exact bytes are untested - refusing to ship."; echo HALT > /tmp/halt3 ;;
+                *)       echo "::error::$NAME: required check '$CHECK' is '$CONC' on $SHA."; echo HALT > /tmp/halt3 ;;
+              esac
+            done
+          done
+          [ -f /tmp/halt3 ] && exit 1 || true
+
+      - name: Phase 4 - verify maintenance is on
+        if: inputs.maintenance_ack == 'maintenance-on'
+        run: |
+          # PILOT STUB. In dash-infra this queries prod BE GraphQL for maintenance status and
+          # requires enabled:true before shipping a migration-bearing batch.
+          echo "::warning::maintenance verify is a stub in the pilot - dash-infra must query prod and require enabled:true here."
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Maintenance: acknowledged \`maintenance-on\` (verification stubbed in pilot)." >> "$GITHUB_STEP_SUMMARY"
+
+      # ----------------------------------------------------------------- phase 5: ship
+      - name: Phase 5 - ship in order
+        id: ship
+        run: |
+          set -uo pipefail
+          TIMEOUT=$(jq -r .deploy_timeout_minutes config/repos.json)
+          : > /tmp/results.jsonl
+          FAILED=""
+
+          for i in $(seq 0 $(( $(jq 'length' /tmp/checked.json) - 1 ))); do
+            r=$(jq -c ".[$i]" /tmp/checked.json)
+            NAME=$(echo "$r" | jq -r .name)
+            SHA=$(echo "$r" | jq -r .pinned)
+            DELTA=$(echo "$r" | jq -r .delta)
+            WF=$(echo "$r" | jq -r .deploy_workflow)
+
+            if [ -n "$FAILED" ]; then
+              echo "::warning::$NAME: NOT SHIPPED - aborted after $FAILED failed"
+              echo "$r" | jq -c '. + {result:"not-attempted"}' >> /tmp/results.jsonl
+              continue
+            fi
+
+            CURRENT=$(gh api "repos/$ORG/$NAME/git/ref/heads/main" --jq .object.sha)
+            if [ "$CURRENT" = "$SHA" ]; then
+              # Idempotent: a re-press after a mid-run failure resumes instead of redoing.
+              echo "$NAME: main already at pinned SHA - skip"
+              echo "$r" | jq -c '. + {result:"already-shipped"}' >> /tmp/results.jsonl
+              continue
+            fi
+            if [ "$DELTA" = "0" ]; then
+              echo "$NAME: no delta - no-op"
+              echo "$r" | jq -c '. + {result:"no-op"}' >> /tmp/results.jsonl
+              continue
+            fi
+
+            # force:false makes this fast-forward-only, enforced server-side. A non-ff
+            # advance returns 422 rather than rewriting anything.
+            echo "$NAME: fast-forwarding main -> ${SHA:0:8}"
+            if ! gh api -X PATCH "repos/$ORG/$NAME/git/refs/heads/main" \
+                   -f sha="$SHA" -F force=false > /tmp/push.json 2>/tmp/push.err; then
+              echo "::error::$NAME: fast-forward push REJECTED. $(cat /tmp/push.err)"
+              echo "$r" | jq -c '. + {result:"push-rejected"}' >> /tmp/results.jsonl
+              FAILED="$NAME"; continue
+            fi
+
+            # Deploy-wait: never move to the next repo on an unverified deploy.
+            echo "$NAME: waiting for deploy of ${SHA:0:8}"
+            RUN_ID=""; CONC=""
+            for attempt in $(seq 1 $(( TIMEOUT * 4 ))); do
+              sleep 15
+              RUN_ID=$(gh run list -R "$ORG/$NAME" --workflow "$WF" --limit 20 \
+                --json databaseId,headSha,status,conclusion \
+                --jq "[.[] | select(.headSha==\"$SHA\")] | first | .databaseId" 2>/dev/null)
+              if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then continue; fi
+              STATUS=$(gh run view "$RUN_ID" -R "$ORG/$NAME" --json status,conclusion --jq .status)
+              if [ "$STATUS" = "completed" ]; then
+                CONC=$(gh run view "$RUN_ID" -R "$ORG/$NAME" --json conclusion --jq .conclusion)
+                break
+              fi
+            done
+
+            if [ "$CONC" != "success" ]; then
+              echo "::error::$NAME: prod deploy did not succeed (conclusion='${CONC:-timeout}'). main IS already advanced to ${SHA:0:8} - production may be running old code. Check deploy-state/state.json."
+              echo "$r" | jq -c --arg c "${CONC:-timeout}" '. + {result:("deploy-" + $c), deploy_run:"'"$RUN_ID"'"}' >> /tmp/results.jsonl
+              FAILED="$NAME"; continue
+            fi
+
+            echo "$NAME: shipped and deployed"
+            echo "$r" | jq -c --arg run "$RUN_ID" '. + {result:"shipped", deploy_run:$run}' >> /tmp/results.jsonl
+          done
+
+          jq -s -c . /tmp/results.jsonl > /tmp/results.json
+          {
+            echo ""
+            echo "### Ship result"
+            echo ""
+            echo "| repo | delta | result |"
+            echo "|---|---|---|"
+            jq -r '.[] | "| \(.name) | \(.delta) | **\(.result)** |"' /tmp/results.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$FAILED" ]; then
+            echo "::error::RUN HALTED at $FAILED. Repos after it were not attempted. Fix forward, then re-press - shipped repos are skipped automatically."
+            echo "halted=$FAILED" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # --------------------------------------------------------------- phase 6: record
+      - name: Phase 6 - tag moved repos and commit the manifest
+        if: always() && steps.pin.outcome == 'success'
+        run: |
+          set -uo pipefail
+          if [ ! -f /tmp/results.json ]; then
+            echo "::notice::run halted before shipping - no manifest written"
+            exit 0
+          fi
+          PRUNE=$(jq -r .tag_prune_days config/repos.json)
+
+          # Tags only on repos whose main actually moved. The manifest - not the tag set -
+          # is the restore-point index, because a repo that did not move has no tag for
+          # this run and would otherwise be unfindable.
+          jq -c '.[] | select(.result=="shipped")' /tmp/results.json | while read -r r; do
+            NAME=$(echo "$r" | jq -r .name)
+            SHA=$(echo "$r" | jq -r .pinned)
+            if gh api -X POST "repos/$ORG/$NAME/git/refs" \
+                 -f ref="refs/tags/promote/$TS" -f sha="$SHA" >/dev/null 2>&1; then
+              echo "tagged $NAME promote/$TS"
+            else
+              # Tags are immutable by policy - never moved. A collision means this run is a
+              # re-press within the same minute; the existing tag already marks the SHA.
+              echo "::notice::$NAME: tag promote/$TS already exists, left untouched"
+            fi
+
+            CUTOFF=$(date -u -d "-$PRUNE days" +%Y-%m-%d)
+            gh api "repos/$ORG/$NAME/git/matching-refs/tags/promote/" --jq '.[].ref' 2>/dev/null \
+            | sed 's|refs/tags/||' | while read -r TAG; do
+                TAGDATE=$(echo "$TAG" | sed 's|promote/||' | cut -c1-10)
+                if [[ "$TAGDATE" < "$CUTOFF" ]]; then
+                  gh api -X DELETE "repos/$ORG/$NAME/git/refs/tags/$TAG" >/dev/null 2>&1 \
+                    && echo "pruned $NAME $TAG"
+                fi
+              done
+          done
+
+          YEAR=$(echo "$TS" | cut -c1-4)
+          mkdir -p "releases/$YEAR"
+          jq -n \
+            --arg ts "$TS" \
+            --arg actor "${{ github.actor }}" \
+            --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg reason "${{ inputs.reason }}" \
+            --argjson forced "${{ inputs.force }}" \
+            --arg ack "${{ inputs.maintenance_ack }}" \
+            --arg selected "${{ inputs.repos }}" \
+            --argjson repos "$(jq -c '[.[] | {name, from:.main_before, to:.pinned, delta, migrations, result, deploy_run:(.deploy_run // null)}]' /tmp/results.json)" \
+            '{timestamp:$ts, actor:$actor, run_url:$run, forced:$forced, reason:$reason,
+              maintenance_ack:$ack, partial:($selected != "all"), repos:$repos}' \
+            > "releases/$YEAR/$TS.json"
+
+          echo "### Manifest" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat "releases/$YEAR/$TS.json" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          git config user.name "promote-bot"
+          git config user.email "promote-bot@users.noreply.github.com"
+          git add "releases/$YEAR/$TS.json"
+          git commit -m "release $TS" || exit 0
+          git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      - name: Phase 7 - report
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # No-op runs report too: silence must never be the same as "nothing to do".
+          SUMMARY="Promote $TS by ${{ github.actor }} - ${{ job.status }}"
+          if [ -f /tmp/results.json ]; then
+            DETAIL=$(jq -r '[.[] | "\(.name): \(.result) (+\(.delta))"] | join(" | ")' /tmp/results.json)
+          else
+            DETAIL="halted in preflight"
+          fi
+          echo "$SUMMARY - $DETAIL"
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            jq -n --arg t "$SUMMARY"$'\n'"$DETAIL"$'\n'"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{text:$t}' | curl -sS -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL"
+          else
+            echo "::notice::SLACK_WEBHOOK_URL not set - report is in the job summary only."
+          fi
