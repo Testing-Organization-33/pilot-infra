@@ -1,0 +1,31 @@
+{
+  "timestamp": "2026-08-27-1338",
+  "actor": "ArtemDokuchaev",
+  "run_url": "https://github.com/Testing-Organization-33/pilot-infra/actions/runs/33077868426",
+  "forced": false,
+  "reason": "",
+  "maintenance_ack": "no-maintenance",
+  "partial": false,
+  "repos": [
+    {
+      "name": "pilot-api",
+      "from": "66078cec7e5be93d7f1eb993fbcfdacb70e85fdd",
+      "to": "9a518a82bd4c81380a58f1e6d26e9592c9039ed4",
+      "delta": 1,
+      "migrations": [
+        "migrations/0002_add_crash_round.sql"
+      ],
+      "result": "shipped",
+      "deploy_run": "33077884234"
+    },
+    {
+      "name": "pilot-web",
+      "from": "e9e0865942ab41a4d39ab5aac04dbd0f21c9cab0",
+      "to": "e9e0865942ab41a4d39ab5aac04dbd0f21c9cab0",
+      "delta": 0,
+      "migrations": [],
+      "result": "no-delta",
+      "deploy_run": null
+    }
+  ]
+}
