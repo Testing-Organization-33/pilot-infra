@@ -83,7 +83,7 @@ The pilot exists to run these deliberately, not to wait for them. Arm failures v
 | # | Scenario | How | Expected |
 |---|---|---|---|
 | 1 | Clean promote | Commit to both `development`s, press | Both ship, manifest + 2 tags, ordered |
-| 2 | One repo at delta 0 | Commit to `pilot-api` only, press | api ships, web `no-op`, manifest records web's unmoved SHA |
+| 2 | One repo at delta 0 | Commit to `pilot-api` only, press | api ships, web `no-delta`, manifest records web's unmoved SHA |
 | 3 | Nothing to ship | Press twice | Second run all `no-op`, still reports |
 | 4 | Red CI | `fail_ci: "unit-tests"` in pilot-api | Phase 3 halt, `main` untouched |
 | 5 | Broken ancestry | Push a commit straight to `pilot-api` `main` | Phase 2 halt naming the sync PR; digest alarms |

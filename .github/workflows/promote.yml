@@ -231,16 +231,21 @@ jobs:
               continue
             fi
 
+            # Order matters for the ledger. Both cases skip the push, but they mean different
+            # things and the manifest is what rollback reads: "no-delta" is a repo that had
+            # nothing to ship, "already-shipped" is a repo this run's own pin already landed
+            # (a re-press resuming after a mid-run failure). Checking delta first keeps them
+            # distinguishable instead of collapsing both into "already-shipped".
             CURRENT=$(gh api "repos/$ORG/$NAME/git/ref/heads/main" --jq .object.sha)
+            if [ "$DELTA" = "0" ]; then
+              echo "$NAME: no delta - nothing to ship"
+              echo "$r" | jq -c '. + {result:"no-delta"}' >> /tmp/results.jsonl
+              continue
+            fi
             if [ "$CURRENT" = "$SHA" ]; then
               # Idempotent: a re-press after a mid-run failure resumes instead of redoing.
               echo "$NAME: main already at pinned SHA - skip"
               echo "$r" | jq -c '. + {result:"already-shipped"}' >> /tmp/results.jsonl
-              continue
-            fi
-            if [ "$DELTA" = "0" ]; then
-              echo "$NAME: no delta - no-op"
-              echo "$r" | jq -c '. + {result:"no-op"}' >> /tmp/results.jsonl
               continue
             fi
 
