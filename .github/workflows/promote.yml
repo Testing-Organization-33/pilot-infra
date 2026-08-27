@@ -1,30 +1,30 @@
 name: Promote
-run-name: "Promote ${{ inputs.repos }}${{ inputs.force == true && ' [FORCED]' || '' }}"
+run-name: "Promote ${{ inputs.repos }}${{ inputs.allow_big_batch == true && ' [BIG BATCH]' || '' }}"
 
 on:
   workflow_dispatch:
     inputs:
       repos:
-        description: "'all', or a comma-separated list of exact repo names from config/repos.json (not nicknames - 'pilot-api', never 'backend'). Examples: all | pilot-api | pilot-api,pilot-web. Order is ignored; ship order always wins. A subset marks the run PARTIAL and needs a reason."
+        description: "'all', or exact repo names comma-separated. A subset needs a reason."
         required: true
         default: "all"
         type: string
-      force:
-        description: "Overrides ONLY the batch circuit breaker (a repo's delta exceeding breaker_delta). Does NOT bypass CI checks, ancestry, the migration ack, deploy waits, or an active pause - nothing else is skippable. Needs a reason."
+      allow_big_batch:
+        description: "Allow a batch over the per-repo limit (40 commits). Allows nothing else - CI, ancestry, migrations and pauses still stop the run. Needs a reason."
         required: false
         default: false
         type: boolean
       reason:
-        description: "Why this run is irregular. REQUIRED when force is true OR repos is a subset. Posted verbatim and stored permanently in the release manifest."
+        description: "Why this run is unusual. Required for a subset or a big batch. Goes in the release record, with your name."
         required: false
         default: ""
         type: string
       maintenance_ack:
-        description: "Required when the batch contains migrations."
+        description: "Only matters if the batch adds migrations - then anything but not-answered. not-answered = refuse to ship migrations. screen-is-up = you switched the maintenance screen on, and the run checks prod agrees before shipping. expand-only = the migration only adds things, so users can stay online - your call, nothing verifies it."
         required: false
-        default: "none"
+        default: "not-answered"
         type: choice
-        options: [none, maintenance-on, no-maintenance]
+        options: [not-answered, screen-is-up, expand-only]
 
 # ONE press. SHAs are pinned in phase 1 and everything downstream uses them, never a branch
 # name - so the run ships exactly what it checked. There is no ref input and no candidate
@@ -45,14 +45,14 @@ jobs:
 
       - name: Guard - irregular runs need a reason
         env:
-          IN_FORCE: ${{ inputs.force }}
+          IN_BIG: ${{ inputs.allow_big_batch }}
           IN_REPOS: ${{ inputs.repos }}
           IN_REASON: ${{ inputs.reason }}
         run: |
           # Inputs go through env, never string-interpolated into the script: a reason
           # containing a quote would otherwise break the shell (and later the manifest).
           IRREGULAR=""
-          if [ "$IN_FORCE" = "true" ]; then IRREGULAR="force:true"; fi
+          if [ "$IN_BIG" = "true" ]; then IRREGULAR="allow_big_batch"; fi
           if [ "$IN_REPOS" != "all" ]; then
             IRREGULAR="${IRREGULAR:+$IRREGULAR and }a repo subset ($IN_REPOS)"
           fi
@@ -169,8 +169,8 @@ jobs:
               if [ "$(echo "$MIGS" | jq 'length')" != "0" ]; then echo "MIGS" > /tmp/migs; fi
             fi
 
-            if [ "$AHEAD" -gt "$BREAKER" ] && [ "${{ inputs.force }}" != "true" ]; then
-              echo "::error::$NAME: delta $AHEAD exceeds breaker $BREAKER. Re-run with force:true and a reason if this batch is intended." >&2
+            if [ "$AHEAD" -gt "$BREAKER" ] && [ "${{ inputs.allow_big_batch }}" != "true" ]; then
+              echo "::error::$NAME: delta $AHEAD exceeds the per-repo limit of $BREAKER commits. If that is expected, re-run with allow_big_batch and a reason." >&2
               echo "HALT" > /tmp/halt
             fi
 
@@ -181,8 +181,8 @@ jobs:
           jq -s -c . /tmp/checked.jsonl > /tmp/checked.json
           if [ -f /tmp/halt ]; then exit 1; fi
 
-          if [ -f /tmp/migs ] && [ "${{ inputs.maintenance_ack }}" = "none" ]; then
-            echo "::error::this batch contains migrations. Re-run with maintenance_ack = maintenance-on (turn maintenance on first) or no-maintenance (asserting the migration is expand-only and safe to ship live). Silence is not an option."
+          if [ -f /tmp/migs ] && [ "${{ inputs.maintenance_ack }}" = "not-answered" ]; then
+            echo "::error::this batch adds migrations, so maintenance_ack must be answered. Read the files listed below, then re-run with screen-is-up (you switched the maintenance screen on) or expand-only (it only adds things, users can stay online). Leaving it unanswered is not a way to ship them."
             jq -r '.[] | select((.migrations|length) > 0) | "  " + .name + ": " + (.migrations|tostring)' /tmp/checked.json
             exit 1
           fi
@@ -254,13 +254,13 @@ jobs:
           [ -f /tmp/halt3 ] && exit 1 || true
 
       - name: Phase 4 - verify maintenance is on
-        if: inputs.maintenance_ack == 'maintenance-on'
+        if: inputs.maintenance_ack == 'screen-is-up'
         run: |
           # PILOT STUB. In dash-infra this queries prod BE GraphQL for maintenance status and
           # requires enabled:true before shipping a migration-bearing batch.
           echo "::warning::maintenance verify is a stub in the pilot - dash-infra must query prod and require enabled:true here."
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Maintenance: acknowledged \`maintenance-on\` (verification stubbed in pilot)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Maintenance: acknowledged \`screen-is-up\` (verification stubbed in pilot)." >> "$GITHUB_STEP_SUMMARY"
 
       # ----------------------------------------------------------------- phase 5: ship
       - name: Phase 5 - ship in order
@@ -401,7 +401,7 @@ jobs:
       - name: Phase 6 - tag moved repos and commit the manifest
         if: always() && steps.pin.outcome == 'success'
         env:
-          IN_FORCE: ${{ inputs.force }}
+          IN_BIG: ${{ inputs.allow_big_batch }}
           IN_REPOS: ${{ inputs.repos }}
           IN_REASON: ${{ inputs.reason }}
           IN_ACK: ${{ inputs.maintenance_ack }}
@@ -446,11 +446,11 @@ jobs:
             --arg actor "${{ github.actor }}" \
             --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --arg reason "$IN_REASON" \
-            --argjson forced "$IN_FORCE" \
+            --argjson bigbatch "$IN_BIG" \
             --arg ack "$IN_ACK" \
             --arg selected "$IN_REPOS" \
             --argjson repos "$(jq -c '[.[] | {name, from:.main_before, to:.pinned, delta, migrations, result, deploy_run:(.deploy_run // null)}]' /tmp/results.json)" \
-            '{timestamp:$ts, actor:$actor, run_url:$run, forced:$forced, reason:$reason,
+            '{timestamp:$ts, actor:$actor, run_url:$run, big_batch_allowed:$bigbatch, reason:$reason,
               maintenance_ack:$ack, partial:($selected != "all"), repos:$repos}' \
             > "releases/$YEAR/$TS.json"
 

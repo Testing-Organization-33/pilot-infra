@@ -32,39 +32,48 @@ Actions → **Promote** → Run workflow.
 
 | Input | Use |
 |---|---|
-| `repos` | `all`, or a comma-separated list of **exact repo names** from `config/repos.json`. Examples: `all` · `pilot-api` · `pilot-api,pilot-web`. Nicknames like `backend` are rejected, unknown names are rejected, order is ignored (ship order always wins), spaces after commas are fine. A subset marks the manifest `partial: true` **and requires a reason**. |
-| `force` | Overrides **only** the batch circuit breaker. Requires `reason`. |
-| `reason` | Free text, posted verbatim and stored permanently in the manifest. **Required when `force` is true or `repos` is a subset.** |
-| `maintenance_ack` | `none` fails if the batch contains migrations. `maintenance-on` = maintenance screen is up. `no-maintenance` = asserting the migration is expand-only and safe to ship live. |
+| `repos` | `all`, or exact repo names comma-separated (`pilot-api,pilot-web`). Order is ignored - ship order always wins. Spaces after commas are fine. Unknown names are rejected rather than skipped. A subset marks the run `partial: true` and needs a reason. |
+| `allow_big_batch` | Lets through a batch over the per-repo limit (`breaker_delta`, 40 commits). Needs a reason. |
+| `reason` | Free text. Required for a subset or a big batch. Stored in the release record with your name. |
+| `maintenance_ack` | Only consulted when the batch adds migrations. See below. |
 
-### What `force` does, and does not
+### allow_big_batch
 
-`force: true` overrides exactly one thing: the **batch circuit breaker**, which refuses a run when any
-repo's delta exceeds `breaker_delta` (40). Nothing else is skippable by it — not the CI gate, not the
-ancestry check, not the migration acknowledgement, not the deploy waits, not an active pause. If you
-find yourself wanting to force past one of those, the answer is elsewhere.
+Allows exactly one thing: a repo's delta exceeding the per-repo commit limit. It allows nothing else -
+CI, ancestry, the migration ack, deploy waits and an active pause all still stop the run. There is no
+input that ships red or non-fast-forward code.
 
-Use it when a large delta is *expected and understood*:
+Use it when a large delta is expected and understood: a deliberate big promotion (the FE Boost branch
+at ~253 commits), the first run after the pipeline goes live with a queue already past the limit, or
+the first run back after a holiday.
 
-- A deliberate big promotion, e.g. the FE Boost branch at ~253 commits ahead of `main`.
-- The first run after the pipeline goes live, when the existing queue is already past the threshold.
-- The first run back after a holiday or a long pause, where the queue grew legitimately.
+Do not use it on a limit you did not expect. An unexpected 40+ delta means something merged that you
+do not know about - read the compare view first. The limit firing is the feature.
 
-Do not use it to get past a breaker you did not expect. An unexpected 40+ delta means something
-merged that you do not know about — read the compare view first. The breaker firing is the feature.
+### maintenance_ack
+
+Ignored unless the batch adds migration files. When it does, the run refuses to ship until this is
+answered - and note the asymmetry: one value is checked against production, the other is taken on
+trust.
+
+| Value | Means | What the run does |
+|---|---|---|
+| `not-answered` | nothing said (default) | **Halts**, listing the migration files to read. |
+| `screen-is-up` | you switched the maintenance screen on | **Verifies prod agrees** (`enabled: true`) before shipping, and halts if it does not. |
+| `expand-only` | the migration only adds things, users can stay online | Ships live. **Your call - nothing verifies it.** |
+
+The default failing is the point: you cannot ship a migration by not thinking about it. The gate is
+not "is this migration dangerous" - a workflow cannot judge that - it is "did a named person decide".
 
 ### Reason, worked examples
 
-A reason is only demanded for irregular runs, because those are the ones nobody will remember in six
-months and the manifest is what rollback reads.
-
 - Subset: `"FE only - DASH-812 hotfix, QA signed off. BE development has untested welcome-pack work, unsafe to ship."`
-- Force: `"Boost branch, 253 commits, deliberate. BOOSTS flag verified OFF in prod, QA smoke done on dev stand."`
+- Big batch: `"Boost branch, 253 commits, deliberate. BOOSTS flag verified OFF in prod, QA smoke done on dev stand."`
 - Both: `"BE only, 60 commits after the holiday pause. Reviewed the compare, all tickets QA-passed."`
 
-The first of those is the one that matters most: a partial promotion is the riskiest ordinary thing
-this workflow can do, because BE and admin share a MySQL schema and FE consumes BE's GraphQL. Saying
-which repo you are *deliberately leaving behind*, and why it is unsafe, is the record.
+The first matters most: a partial promotion is the riskiest ordinary run here, because BE and admin
+share a MySQL schema and FE consumes BE's GraphQL. Naming the repo you are *deliberately leaving
+behind*, and why it is unsafe, is the record.
 
 ## What it does, in order
 
