@@ -5,17 +5,17 @@ on:
   workflow_dispatch:
     inputs:
       repos:
-        description: "Which repos to promote. 'all' = full ship order. A subset marks the run PARTIAL."
+        description: "'all', or a comma-separated list of exact repo names from config/repos.json (not nicknames - 'pilot-api', never 'backend'). Examples: all | pilot-api | pilot-api,pilot-web. Order is ignored; ship order always wins. A subset marks the run PARTIAL and needs a reason."
         required: true
         default: "all"
         type: string
       force:
-        description: "Override the batch circuit breaker and the weekend-eve warning. Requires a reason."
+        description: "Overrides ONLY the batch circuit breaker (a repo's delta exceeding breaker_delta). Does NOT bypass CI checks, ancestry, the migration ack, deploy waits, or an active pause - nothing else is skippable. Needs a reason."
         required: false
         default: false
         type: boolean
       reason:
-        description: "Why this run is irregular. Posted verbatim and stored in the manifest."
+        description: "Why this run is irregular. REQUIRED when force is true OR repos is a subset. Posted verbatim and stored permanently in the release manifest."
         required: false
         default: ""
         type: string
@@ -43,15 +43,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Guard - force requires a reason
-        if: inputs.force == true && inputs.reason == ''
+      - name: Guard - irregular runs need a reason
+        env:
+          IN_FORCE: ${{ inputs.force }}
+          IN_REPOS: ${{ inputs.repos }}
+          IN_REASON: ${{ inputs.reason }}
         run: |
-          echo "::error::force:true requires a reason. It is recorded in the manifest and posted verbatim."
-          exit 1
+          # Inputs go through env, never string-interpolated into the script: a reason
+          # containing a quote would otherwise break the shell (and later the manifest).
+          IRREGULAR=""
+          if [ "$IN_FORCE" = "true" ]; then IRREGULAR="force:true"; fi
+          if [ "$IN_REPOS" != "all" ]; then
+            IRREGULAR="${IRREGULAR:+$IRREGULAR and }a repo subset ($IN_REPOS)"
+          fi
+          if [ -n "$IRREGULAR" ] && [ -z "$IN_REASON" ]; then
+            echo "::error::$IRREGULAR requires a reason. It is posted verbatim and stored permanently in the release manifest. A partial or forced promotion with no recorded why is exactly what this gate exists to prevent - in six months nobody will remember, and the manifest is what rollback reads."
+            exit 1
+          fi
+          if [ -n "$IRREGULAR" ]; then echo "irregular run ($IRREGULAR), reason recorded"; fi
 
       # ---------------------------------------------------------------- phase 1: pin
       - name: Phase 1 - pin development tips
         id: pin
+        env:
+          IN_REPOS: ${{ inputs.repos }}
         run: |
           set -euo pipefail
           ORG=$(jq -r .org config/repos.json)
@@ -59,12 +74,26 @@ jobs:
           echo "TS=$TS" >> "$GITHUB_ENV"
           echo "ORG=$ORG" >> "$GITHUB_ENV"
 
-          if [ "${{ inputs.repos }}" = "all" ]; then
+          if [ "$IN_REPOS" = "all" ]; then
             SELECTED=$(jq -c '[.ship_order[].name]' config/repos.json)
           else
-            SELECTED=$(echo "${{ inputs.repos }}" | tr ',' '\n' | jq -R . | jq -sc .)
+            # Tolerate "a, b" as well as "a,b"; drop empties from a trailing comma.
+            SELECTED=$(printf '%s' "$IN_REPOS" | tr ',' '\n' \
+              | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' \
+              | jq -R . | jq -sc .)
           fi
           echo "selected: $SELECTED"
+
+          # Every requested name must exist. Silently ignoring a typo would mean a repo the
+          # presser believed they were shipping quietly stays behind - and the manifest would
+          # look deliberate.
+          UNKNOWN=$(jq -r --argjson sel "$SELECTED" \
+            '[.ship_order[].name] as $known | [$sel[] | select(. as $n | $known | index($n) | not)] | join(", ")' \
+            config/repos.json)
+          if [ -n "$UNKNOWN" ]; then
+            echo "::error::unknown repo name(s): $UNKNOWN. Valid names are: $(jq -r '[.ship_order[].name] | join(", ")' config/repos.json). Use exact repo names, not nicknames."
+            exit 1
+          fi
 
           # Preserve ship order regardless of how the input was typed.
           jq -c --argjson sel "$SELECTED" \
@@ -73,7 +102,7 @@ jobs:
 
           COUNT=$(jq 'length' /tmp/plan.json)
           if [ "$COUNT" = "0" ]; then
-            echo "::error::no repos matched '${{ inputs.repos }}'"
+            echo "::error::no repos selected from '$IN_REPOS'"
             exit 1
           fi
 
@@ -371,6 +400,11 @@ jobs:
       # --------------------------------------------------------------- phase 6: record
       - name: Phase 6 - tag moved repos and commit the manifest
         if: always() && steps.pin.outcome == 'success'
+        env:
+          IN_FORCE: ${{ inputs.force }}
+          IN_REPOS: ${{ inputs.repos }}
+          IN_REASON: ${{ inputs.reason }}
+          IN_ACK: ${{ inputs.maintenance_ack }}
         run: |
           set -uo pipefail
           if [ ! -f /tmp/results.json ]; then
@@ -411,10 +445,10 @@ jobs:
             --arg ts "$TS" \
             --arg actor "${{ github.actor }}" \
             --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --arg reason "${{ inputs.reason }}" \
-            --argjson forced "${{ inputs.force }}" \
-            --arg ack "${{ inputs.maintenance_ack }}" \
-            --arg selected "${{ inputs.repos }}" \
+            --arg reason "$IN_REASON" \
+            --argjson forced "$IN_FORCE" \
+            --arg ack "$IN_ACK" \
+            --arg selected "$IN_REPOS" \
             --argjson repos "$(jq -c '[.[] | {name, from:.main_before, to:.pinned, delta, migrations, result, deploy_run:(.deploy_run // null)}]' /tmp/results.json)" \
             '{timestamp:$ts, actor:$actor, run_url:$run, forced:$forced, reason:$reason,
               maintenance_ack:$ack, partial:($selected != "all"), repos:$repos}' \

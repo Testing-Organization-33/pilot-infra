@@ -32,10 +32,39 @@ Actions → **Promote** → Run workflow.
 
 | Input | Use |
 |---|---|
-| `repos` | `all`, or a comma-separated subset. A subset marks the manifest `partial: true`. |
-| `force` | Overrides the batch circuit breaker. Requires `reason`. |
-| `reason` | Recorded in the manifest and posted verbatim. Required with `force`. |
+| `repos` | `all`, or a comma-separated list of **exact repo names** from `config/repos.json`. Examples: `all` · `pilot-api` · `pilot-api,pilot-web`. Nicknames like `backend` are rejected, unknown names are rejected, order is ignored (ship order always wins), spaces after commas are fine. A subset marks the manifest `partial: true` **and requires a reason**. |
+| `force` | Overrides **only** the batch circuit breaker. Requires `reason`. |
+| `reason` | Free text, posted verbatim and stored permanently in the manifest. **Required when `force` is true or `repos` is a subset.** |
 | `maintenance_ack` | `none` fails if the batch contains migrations. `maintenance-on` = maintenance screen is up. `no-maintenance` = asserting the migration is expand-only and safe to ship live. |
+
+### What `force` does, and does not
+
+`force: true` overrides exactly one thing: the **batch circuit breaker**, which refuses a run when any
+repo's delta exceeds `breaker_delta` (40). Nothing else is skippable by it — not the CI gate, not the
+ancestry check, not the migration acknowledgement, not the deploy waits, not an active pause. If you
+find yourself wanting to force past one of those, the answer is elsewhere.
+
+Use it when a large delta is *expected and understood*:
+
+- A deliberate big promotion, e.g. the FE Boost branch at ~253 commits ahead of `main`.
+- The first run after the pipeline goes live, when the existing queue is already past the threshold.
+- The first run back after a holiday or a long pause, where the queue grew legitimately.
+
+Do not use it to get past a breaker you did not expect. An unexpected 40+ delta means something
+merged that you do not know about — read the compare view first. The breaker firing is the feature.
+
+### Reason, worked examples
+
+A reason is only demanded for irregular runs, because those are the ones nobody will remember in six
+months and the manifest is what rollback reads.
+
+- Subset: `"FE only - DASH-812 hotfix, QA signed off. BE development has untested welcome-pack work, unsafe to ship."`
+- Force: `"Boost branch, 253 commits, deliberate. BOOSTS flag verified OFF in prod, QA smoke done on dev stand."`
+- Both: `"BE only, 60 commits after the holiday pause. Reviewed the compare, all tickets QA-passed."`
+
+The first of those is the one that matters most: a partial promotion is the riskiest ordinary thing
+this workflow can do, because BE and admin share a MySQL schema and FE consumes BE's GraphQL. Saying
+which repo you are *deliberately leaving behind*, and why it is unsafe, is the record.
 
 ## What it does, in order
 
