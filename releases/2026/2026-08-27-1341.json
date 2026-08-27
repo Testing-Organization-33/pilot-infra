@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-08-27-1341",
+  "actor": "ArtemDokuchaev",
+  "run_url": "https://github.com/Testing-Organization-33/pilot-infra/actions/runs/33078118667",
+  "forced": true,
+  "reason": "crash curve fix requested by co-founder, delta is 2 trivial commits",
+  "maintenance_ack": "none",
+  "partial": false,
+  "repos": [
+    {
+      "name": "pilot-api",
+      "from": "9a518a82bd4c81380a58f1e6d26e9592c9039ed4",
+      "to": "a627f22c44fb2524f7f051868d2d673b846dd2e6",
+      "delta": 2,
+      "migrations": [],
+      "result": "shipped",
+      "deploy_run": "33078140717"
+    },
+    {
+      "name": "pilot-web",
+      "from": "e9e0865942ab41a4d39ab5aac04dbd0f21c9cab0",
+      "to": "e9e0865942ab41a4d39ab5aac04dbd0f21c9cab0",
+      "delta": 0,
+      "migrations": [],
+      "result": "no-delta",
+      "deploy_run": null
+    }
+  ]
+}
