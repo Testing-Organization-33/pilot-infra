@@ -71,7 +71,7 @@ ls releases/*/                       # newest last
 jq . releases/2026/2026-08-26-1400.json
 ```
 
-`repos[].from` / `.to` are that repo's `main` before and after. `delta: 0` with `result: "no-op"` means
+`repos[].from` / `.to` are that repo's `main` before and after. `delta: 0` with `result: "no-delta"` means
 it did not move — and it is still recorded, which is what makes every manifest a complete four-repo
 snapshot and what makes tags unnecessary as an index.
 
@@ -84,7 +84,7 @@ The pilot exists to run these deliberately, not to wait for them. Arm failures v
 |---|---|---|---|
 | 1 | Clean promote | Commit to both `development`s, press | Both ship, manifest + 2 tags, ordered |
 | 2 | One repo at delta 0 | Commit to `pilot-api` only, press | api ships, web `no-delta`, manifest records web's unmoved SHA |
-| 3 | Nothing to ship | Press twice | Second run all `no-op`, still reports |
+| 3 | Nothing to ship | Press twice | Second run all `no-delta`, still reports |
 | 4 | Red CI | `fail_ci: "unit-tests"` in pilot-api | Phase 3 halt, `main` untouched |
 | 5 | Broken ancestry | Push a commit straight to `pilot-api` `main` | Phase 2 halt naming the sync PR; digest alarms |
 | 6 | Deploy fails on repo 2 | `fail_deploy: "health"` in pilot-web | api shipped, web `deploy-failure`, halt; re-press skips api |
