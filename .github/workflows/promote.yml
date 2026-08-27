@@ -216,7 +216,35 @@ jobs:
           set -uo pipefail
           TIMEOUT=$(jq -r .deploy_timeout_minutes config/repos.json)
           : > /tmp/results.jsonl
-          FAILED=""
+          rm -f /tmp/failed_repo /tmp/last_run_id
+
+          # Newest COMPLETED deploy conclusion for an exact SHA. Empty = never deployed.
+          deploy_conclusion() {
+            gh run list -R "$ORG/$1" --workflow "$2" --limit 30 \
+              --json headSha,status,conclusion \
+              --jq "[.[] | select(.headSha==\"$3\" and .status==\"completed\")] | first | .conclusion" 2>/dev/null
+          }
+
+          # Block until a deploy for SHA completes. Echoes the conclusion, or "timeout".
+          # Records the run id in /tmp/last_run_id (not stdout - stdout is the return value).
+          wait_deploy() {
+            local N=$1 WF=$2 S=$3 RID ST
+            rm -f /tmp/last_run_id
+            for _ in $(seq 1 $(( TIMEOUT * 4 ))); do
+              sleep 15
+              RID=$(gh run list -R "$ORG/$N" --workflow "$WF" --limit 30 \
+                --json databaseId,headSha \
+                --jq "[.[] | select(.headSha==\"$S\")] | first | .databaseId" 2>/dev/null)
+              if [ -z "$RID" ] || [ "$RID" = "null" ]; then continue; fi
+              ST=$(gh run view "$RID" -R "$ORG/$N" --json status --jq .status)
+              if [ "$ST" = "completed" ]; then
+                echo "$RID" > /tmp/last_run_id
+                gh run view "$RID" -R "$ORG/$N" --json conclusion --jq .conclusion
+                return
+              fi
+            done
+            echo "timeout"
+          }
 
           for i in $(seq 0 $(( $(jq 'length' /tmp/checked.json) - 1 ))); do
             r=$(jq -c ".[$i]" /tmp/checked.json)
@@ -225,28 +253,53 @@ jobs:
             DELTA=$(echo "$r" | jq -r .delta)
             WF=$(echo "$r" | jq -r .deploy_workflow)
 
-            if [ -n "$FAILED" ]; then
-              echo "::warning::$NAME: NOT SHIPPED - aborted after $FAILED failed"
+            if [ -f /tmp/failed_repo ]; then
+              echo "::warning::$NAME: NOT SHIPPED - aborted after $(cat /tmp/failed_repo) failed"
               echo "$r" | jq -c '. + {result:"not-attempted"}' >> /tmp/results.jsonl
               continue
             fi
 
-            # Order matters for the ledger. Both cases skip the push, but they mean different
-            # things and the manifest is what rollback reads: "no-delta" is a repo that had
-            # nothing to ship, "already-shipped" is a repo this run's own pin already landed
-            # (a re-press resuming after a mid-run failure). Checking delta first keeps them
-            # distinguishable instead of collapsing both into "already-shipped".
             CURRENT=$(gh api "repos/$ORG/$NAME/git/ref/heads/main" --jq .object.sha)
-            if [ "$DELTA" = "0" ]; then
-              echo "$NAME: no delta - nothing to ship"
-              echo "$r" | jq -c '. + {result:"no-delta"}' >> /tmp/results.jsonl
+
+            # "Shipped" means main advanced AND the deploy for that SHA went green. Those are
+            # two separate facts, and only checking the ref made a repo whose deploy failed
+            # look finished on the next press - so a green run could sit on top of a broken
+            # production. Verified in the pilot 2026-08-27. The ref is never enough.
+            if [ "$CURRENT" = "$SHA" ]; then
+              CONC=$(deploy_conclusion "$NAME" "$WF" "$SHA")
+              if [ "$CONC" = "success" ]; then
+                if [ "$DELTA" = "0" ]; then
+                  echo "$NAME: no delta, prod healthy on ${SHA:0:8} - nothing to do"
+                  echo "$r" | jq -c '. + {result:"no-delta"}' >> /tmp/results.jsonl
+                else
+                  echo "$NAME: main already at pinned SHA and deployed green - skip"
+                  echo "$r" | jq -c '. + {result:"already-shipped"}' >> /tmp/results.jsonl
+                fi
+                continue
+              fi
+
+              # main is where it belongs but production is not on it. Retry the deploy: this
+              # is what "re-press resumes where it stopped" has to actually mean.
+              echo "::warning::$NAME: main is at ${SHA:0:8} but its deploy is '${CONC:-never ran}'. Re-dispatching the deploy."
+              gh workflow run "$WF" -R "$ORG/$NAME" --ref main >/dev/null 2>&1 || true
+              CONC=$(wait_deploy "$NAME" "$WF" "$SHA")
+              RID=$(cat /tmp/last_run_id 2>/dev/null || echo "")
+              if [ "$CONC" != "success" ]; then
+                echo "::error::$NAME: redeploy of ${SHA:0:8} failed ('$CONC'). Production is NOT running the SHA main points at."
+                echo "$r" | jq -c --arg c "$CONC" --arg run "$RID" '. + {result:("redeploy-"+$c), deploy_run:$run}' >> /tmp/results.jsonl
+                echo "$NAME" > /tmp/failed_repo; continue
+              fi
+              echo "$NAME: redeployed ${SHA:0:8} successfully"
+              echo "$r" | jq -c --arg run "$RID" '. + {result:"redeployed", deploy_run:$run}' >> /tmp/results.jsonl
               continue
             fi
-            if [ "$CURRENT" = "$SHA" ]; then
-              # Idempotent: a re-press after a mid-run failure resumes instead of redoing.
-              echo "$NAME: main already at pinned SHA - skip"
-              echo "$r" | jq -c '. + {result:"already-shipped"}' >> /tmp/results.jsonl
-              continue
+
+            if [ "$DELTA" = "0" ]; then
+              # delta 0 but main != pinned means main is AHEAD of development. Preflight's
+              # ancestry check should have caught it; refuse rather than guess.
+              echo "::error::$NAME: delta is 0 but main (${CURRENT:0:8}) != pinned (${SHA:0:8}). Ancestry is inconsistent - stopping."
+              echo "$r" | jq -c '. + {result:"inconsistent"}' >> /tmp/results.jsonl
+              echo "$NAME" > /tmp/failed_repo; continue
             fi
 
             # force:false makes this fast-forward-only, enforced server-side. A non-ff
@@ -261,28 +314,17 @@ jobs:
 
             # Deploy-wait: never move to the next repo on an unverified deploy.
             echo "$NAME: waiting for deploy of ${SHA:0:8}"
-            RUN_ID=""; CONC=""
-            for attempt in $(seq 1 $(( TIMEOUT * 4 ))); do
-              sleep 15
-              RUN_ID=$(gh run list -R "$ORG/$NAME" --workflow "$WF" --limit 20 \
-                --json databaseId,headSha,status,conclusion \
-                --jq "[.[] | select(.headSha==\"$SHA\")] | first | .databaseId" 2>/dev/null)
-              if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then continue; fi
-              STATUS=$(gh run view "$RUN_ID" -R "$ORG/$NAME" --json status,conclusion --jq .status)
-              if [ "$STATUS" = "completed" ]; then
-                CONC=$(gh run view "$RUN_ID" -R "$ORG/$NAME" --json conclusion --jq .conclusion)
-                break
-              fi
-            done
+            CONC=$(wait_deploy "$NAME" "$WF" "$SHA")
+            RID=$(cat /tmp/last_run_id 2>/dev/null || echo "")
 
             if [ "$CONC" != "success" ]; then
-              echo "::error::$NAME: prod deploy did not succeed (conclusion='${CONC:-timeout}'). main IS already advanced to ${SHA:0:8} - production may be running old code. Check deploy-state/state.json."
-              echo "$r" | jq -c --arg c "${CONC:-timeout}" '. + {result:("deploy-" + $c), deploy_run:"'"$RUN_ID"'"}' >> /tmp/results.jsonl
-              FAILED="$NAME"; continue
+              echo "::error::$NAME: prod deploy did not succeed ('$CONC'). main IS already advanced to ${SHA:0:8} - production may still be on old code. Inspect deploy-state/state.json, fix forward, then re-press: the retry path re-dispatches this deploy rather than skipping it."
+              echo "$r" | jq -c --arg c "$CONC" --arg run "$RID" '. + {result:("deploy-"+$c), deploy_run:$run}' >> /tmp/results.jsonl
+              echo "$NAME" > /tmp/failed_repo; continue
             fi
 
             echo "$NAME: shipped and deployed"
-            echo "$r" | jq -c --arg run "$RUN_ID" '. + {result:"shipped", deploy_run:$run}' >> /tmp/results.jsonl
+            echo "$r" | jq -c --arg run "$RID" '. + {result:"shipped", deploy_run:$run}' >> /tmp/results.jsonl
           done
 
           jq -s -c . /tmp/results.jsonl > /tmp/results.json
@@ -295,9 +337,10 @@ jobs:
             jq -r '.[] | "| \(.name) | \(.delta) | **\(.result)** |"' /tmp/results.json
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -n "$FAILED" ]; then
-            echo "::error::RUN HALTED at $FAILED. Repos after it were not attempted. Fix forward, then re-press - shipped repos are skipped automatically."
-            echo "halted=$FAILED" >> "$GITHUB_OUTPUT"
+          if [ -f /tmp/failed_repo ]; then
+            HALTED=$(cat /tmp/failed_repo)
+            echo "::error::RUN HALTED at ${HALTED}. Repos after it were not attempted. Fix forward, then re-press: repos already shipped AND deployed green are skipped, a repo whose deploy failed is retried."
+            echo "halted=${HALTED}" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 

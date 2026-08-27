@@ -45,15 +45,17 @@ Actions → **Promote** → Run workflow.
 | 2 Preflight | Pause check, ancestry, delta, migration scan, circuit breaker (40 commits) | Broken ancestry, active pause, unforced breaker, migrations with no ack |
 | 3 CI gate | Verify the pinned SHA has green required checks | Any check red or never run |
 | 4 Maintenance | Verify prod maintenance is on *(stubbed in the pilot)* | Maintenance off |
-| 5 Ship | Per repo in order: skip if already there, fast-forward `main`, wait for the prod deploy | Push rejected, deploy failed, deploy timeout |
+| 5 Ship | Per repo in order: skip only if shipped **and** deployed green, retry a failed deploy, otherwise fast-forward `main` and wait for the prod deploy | Push rejected, deploy failed, redeploy failed, timeout, inconsistent ancestry |
 | 6 Record | Tag repos that moved, prune tags > 90d, commit the manifest | — |
 | 7 Report | Job summary + Slack, including no-op runs | — |
 
 Fast-forward is enforced server-side: the ref update is sent with `force=false`, so a non-fast-forward
 advance returns 422 instead of rewriting anything.
 
-**A failed run is fixed forward and re-pressed.** Phase 5 skips repos whose `main` already equals the
-pinned SHA, so the run resumes where it stopped. There is no recovery mode to learn.
+**A failed run is fixed forward and re-pressed.** Phase 5 treats a repo as done only when `main` is at
+the pinned SHA **and** the deploy for that SHA went green - those are two separate facts. A repo whose
+deploy failed is re-dispatched on the next press rather than skipped, so the run genuinely resumes
+where it stopped. There is no recovery mode to learn.
 
 ## Where things live
 
@@ -87,7 +89,7 @@ The pilot exists to run these deliberately, not to wait for them. Arm failures v
 | 3 | Nothing to ship | Press twice | Second run all `no-delta`, still reports |
 | 4 | Red CI | `fail_ci: "unit-tests"` in pilot-api | Phase 3 halt, `main` untouched |
 | 5 | Broken ancestry | Push a commit straight to `pilot-api` `main` | Phase 2 halt naming the sync PR; digest alarms |
-| 6 | Deploy fails on repo 2 | `fail_deploy: "health"` in pilot-web | api shipped, web `deploy-failure`, halt; re-press skips api |
+| 6 | Deploy fails on repo 2 | `fail_deploy: "health"` in pilot-web | api shipped, web `deploy-failure`, halt; re-press skips api and **retries web's deploy** rather than skipping it |
 | 7 | Fails after migration | Add a migration + `fail_deploy: "post-migrate-build"` | Schema advanced, `deployed_sha` not — the unrollbackable state, loudly |
 | 8 | Breaker tripped | 41+ commits, or drop `breaker_delta` to 1 | Halt; re-press with force + reason; reason lands in the manifest |
 | 9 | Migration present | Add a migration file, press with `maintenance_ack: none` | Halt demanding an explicit ack |
