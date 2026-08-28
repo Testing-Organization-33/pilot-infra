@@ -34,14 +34,37 @@ permissions:
   contents: write
 
 env:
-  GH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
   TS: ""
 
 jobs:
   promote:
     runs-on: ubuntu-latest
     steps:
+      # The App, not a PAT: the ff push to `main` has to bypass the `pull_request` rule, and a
+      # ruleset bypass actor can only be a role, a team or an App - never a token. Scoping the
+      # bypass to one automation is the whole point; a PAT would mean whitelisting a human.
+      - name: Mint installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Without owner+repositories the token is scoped to THIS repo only and every
+          # cross-repo call 404s - which reads as a permissions fault, not a scoping one.
+          # pilot-infra is in the list because the manifest is committed back to it.
+          repositories: pilot-infra,pilot-api,pilot-web
+
+      # Workflow-level `env:` cannot see step outputs, so GH_TOKEN is exported here instead.
+      # The action masks the token, so it stays redacted in logs after the export.
+      - name: Export token as GH_TOKEN
+        run: echo "GH_TOKEN=${{ steps.app-token.outputs.token }}" >> "$GITHUB_ENV"
+
+      # Same identity for the manifest commit as for the promotion itself - otherwise the
+      # release record is authored by GITHUB_TOKEN while the ship it records was the App.
       - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Guard - irregular runs need a reason
         env:

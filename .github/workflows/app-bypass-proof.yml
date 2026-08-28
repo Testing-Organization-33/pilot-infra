@@ -1,0 +1,81 @@
+name: App bypass proof
+
+# A7 of the App setup runbook. Answers one question and nothing else: does the App's ruleset
+# bypass carry the ff push through the `pull_request` rule?
+#
+# Isolated from promote.yml on purpose. A green promote run proves "something worked"; it cannot
+# tell a working bypass apart from a rule that was never blocking. This does the ref update and
+# reports the raw API result, so removing the bypass and re-running is a one-variable experiment.
+#
+# Reads `development`'s tip and fast-forwards `main` to it - the same PATCH promote.yml uses,
+# force=false so the server enforces fast-forward-only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated repo names in this org to attempt the ff push on."
+        required: true
+        default: "pilot-api,pilot-web"
+        type: string
+
+permissions: {}
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: pilot-infra,pilot-api,pilot-web
+
+      - name: Attempt ff push per repo
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+          IN_REPOS: ${{ inputs.repos }}
+        run: |
+          set -u
+          FAILED=0
+          echo "| repo | bypass on ruleset | main before | development | result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          IFS=',' read -ra REPOS <<< "$IN_REPOS"
+          for R in "${REPOS[@]}"; do
+            R="$(echo "$R" | tr -d '[:space:]')"
+            [ -z "$R" ] && continue
+
+            DEV_SHA="$(gh api "repos/$OWNER/$R/git/ref/heads/development" -q .object.sha)"
+            MAIN_SHA="$(gh api "repos/$OWNER/$R/git/ref/heads/main" -q .object.sha)"
+
+            # Record whether a bypass entry exists, so the summary is self-explaining months later.
+            BYPASS="$(gh api "repos/$OWNER/$R/rulesets" -q '.[] | select(.conditions.ref_name.include[]? == "refs/heads/main") | .id' \
+              | while read -r ID; do
+                  gh api "repos/$OWNER/$R/rulesets/$ID" \
+                    -q '[.bypass_actors[]? | "\(.actor_type):\(.actor_id)"] | join(",")'
+                done | paste -sd';' - )"
+            [ -z "$BYPASS" ] && BYPASS="NONE"
+
+            echo "::group::$R  main=$MAIN_SHA  development=$DEV_SHA  bypass=$BYPASS"
+            if OUT="$(gh api -X PATCH "repos/$OWNER/$R/git/refs/heads/main" \
+                        -F "sha=$DEV_SHA" -F "force=false" 2>&1)"; then
+              RESULT="PUSHED"
+              echo "$OUT"
+            else
+              RESULT="REJECTED"
+              FAILED=1
+              echo "$OUT"
+            fi
+            echo "::endgroup::"
+
+            echo "| \`$R\` | $BYPASS | \`${MAIN_SHA:0:8}\` | \`${DEV_SHA:0:8}\` | **$RESULT** |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          # Non-zero on any rejection so the run's own conclusion carries the answer. In the
+          # negative half of A7 a red run IS the expected result - read the summary table.
+          exit "$FAILED"
