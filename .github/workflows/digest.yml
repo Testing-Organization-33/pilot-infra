@@ -18,9 +18,22 @@ permissions:
 jobs:
   digest:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
     steps:
+      # One identity for the whole pipeline. The digest needs no bypass - it only reads - but
+      # a second long-lived credential is a second thing to rotate, expire and forget.
+      - name: Mint installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: pilot-infra,pilot-api,pilot-web
+
+      # Job-level `env:` cannot see step outputs either, so GH_TOKEN is exported here.
+      - name: Export token as GH_TOKEN
+        run: echo "GH_TOKEN=${{ steps.app-token.outputs.token }}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Build digest
